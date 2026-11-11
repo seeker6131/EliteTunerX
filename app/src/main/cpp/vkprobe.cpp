@@ -18,6 +18,8 @@
 #include <adrenotools/driver.h>
 #endif
 
+#include "shaders_spv.h"
+
 namespace {
 
 std::string esc(const std::string &s) {
@@ -577,6 +579,351 @@ std::string benchImpl(const char *dir, const char *lib, const char *hook, int si
            ",\"fillGBs\":" + num(fillGBs) + "}";
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Compute benchmark: FP32 FMA throughput (GFLOPS) and shader memory bandwidth (GB/s).
+// Timed with GPU timestamp queries when the queue supports them, otherwise wall clock.
+std::string computeImpl(const char *dir, const char *lib, const char *hook, int seconds) {
+    Loader L;
+    if (!L.open(dir, lib, hook)) return err(L.error);
+    Instance I;
+    std::string e;
+    if (!I.create(L.gipa, e)) return err(e);
+    PFN_vkGetInstanceProcAddr gipa = L.gipa;
+    VkInstance inst = I.inst;
+#define LI(name) auto name = reinterpret_cast<PFN_##name>(gipa(inst, #name))
+    LI(vkEnumeratePhysicalDevices);
+    LI(vkGetPhysicalDeviceProperties);
+    LI(vkGetPhysicalDeviceMemoryProperties);
+    LI(vkGetPhysicalDeviceQueueFamilyProperties);
+    LI(vkCreateDevice);
+    LI(vkGetDeviceProcAddr);
+#undef LI
+    if (!vkEnumeratePhysicalDevices || !vkCreateDevice || !vkGetDeviceProcAddr) return err("driver is missing core entry points");
+    uint32_t n = 0;
+    vkEnumeratePhysicalDevices(inst, &n, nullptr);
+    if (n == 0) return err("no Vulkan physical device");
+    std::vector<VkPhysicalDevice> pds(n);
+    vkEnumeratePhysicalDevices(inst, &n, pds.data());
+    VkPhysicalDevice pd = pds[0];
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(pd, &props);
+
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, nullptr);
+    std::vector<VkQueueFamilyProperties> qf(nq);
+    vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf.data());
+    int qfi = -1;
+    for (uint32_t i = 0; i < nq; ++i)
+        if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { qfi = static_cast<int>(i); break; }
+    if (qfi < 0) return err("no compute queue");
+    bool useTs = qf[qfi].timestampValidBits > 0 && props.limits.timestampPeriod > 0;
+
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+    qci.queueFamilyIndex = static_cast<uint32_t>(qfi);
+    qci.queueCount = 1;
+    qci.pQueuePriorities = &prio;
+    VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+    dci.queueCreateInfoCount = 1;
+    dci.pQueueCreateInfos = &qci;
+    VkDevice dev = VK_NULL_HANDLE;
+    VkResult r = vkCreateDevice(pd, &dci, nullptr, &dev);
+    if (r != VK_SUCCESS) return err("vkCreateDevice failed: VkResult " + std::to_string(static_cast<int>(r)));
+
+#define LD(name) auto name = reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(dev, #name))
+    LD(vkDestroyDevice); LD(vkGetDeviceQueue); LD(vkCreateBuffer); LD(vkDestroyBuffer);
+    LD(vkGetBufferMemoryRequirements); LD(vkAllocateMemory); LD(vkFreeMemory); LD(vkBindBufferMemory);
+    LD(vkCreateCommandPool); LD(vkDestroyCommandPool); LD(vkAllocateCommandBuffers); LD(vkBeginCommandBuffer);
+    LD(vkEndCommandBuffer); LD(vkResetCommandBuffer); LD(vkCmdPipelineBarrier); LD(vkQueueSubmit);
+    LD(vkCreateFence); LD(vkDestroyFence); LD(vkWaitForFences); LD(vkResetFences);
+    LD(vkCreateShaderModule); LD(vkDestroyShaderModule); LD(vkCreateDescriptorSetLayout);
+    LD(vkDestroyDescriptorSetLayout); LD(vkCreatePipelineLayout); LD(vkDestroyPipelineLayout);
+    LD(vkCreateComputePipelines); LD(vkDestroyPipeline); LD(vkCreateDescriptorPool); LD(vkDestroyDescriptorPool);
+    LD(vkAllocateDescriptorSets); LD(vkUpdateDescriptorSets); LD(vkCmdBindPipeline); LD(vkCmdBindDescriptorSets);
+    LD(vkCmdPushConstants); LD(vkCmdDispatch); LD(vkCreateQueryPool); LD(vkDestroyQueryPool);
+    LD(vkCmdResetQueryPool); LD(vkCmdWriteTimestamp); LD(vkGetQueryPoolResults); LD(vkCmdFillBuffer);
+#undef LD
+
+    VkQueue queue = VK_NULL_HANDLE;
+    vkGetDeviceQueue(dev, static_cast<uint32_t>(qfi), 0, &queue);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+
+    const uint32_t groupSize = 256;
+    const uint32_t copyGroups = 16384;                       // 4M invocations
+    const VkDeviceSize copyBytes = VkDeviceSize(copyGroups) * groupSize * 16;  // 64 MB per buffer
+    const uint32_t fmaGroups = 4096;                         // 1M invocations
+    const uint32_t fmaIters = 256;
+    const VkDeviceSize fmaBytes = VkDeviceSize(fmaGroups) * groupSize * 16;
+
+    std::string failure;
+    VkBuffer bufs[3] = {};
+    VkDeviceMemory mems[3] = {};
+    VkDeviceSize sizes[3] = {copyBytes, copyBytes, fmaBytes};
+    for (int i = 0; i < 3 && failure.empty(); ++i) {
+        VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        bci.size = sizes[i];
+        bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (vkCreateBuffer(dev, &bci, nullptr, &bufs[i]) != VK_SUCCESS) { failure = "vkCreateBuffer failed"; break; }
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(dev, bufs[i], &req);
+        int type = -1;
+        for (uint32_t t = 0; t < mp.memoryTypeCount; ++t)
+            if ((req.memoryTypeBits & (1u << t)) && (mp.memoryTypes[t].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { type = static_cast<int>(t); break; }
+        if (type < 0)
+            for (uint32_t t = 0; t < mp.memoryTypeCount; ++t)
+                if (req.memoryTypeBits & (1u << t)) { type = static_cast<int>(t); break; }
+        VkMemoryAllocateInfo mai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = static_cast<uint32_t>(type < 0 ? 0 : type);
+        if (type < 0 || vkAllocateMemory(dev, &mai, nullptr, &mems[i]) != VK_SUCCESS) { failure = "vkAllocateMemory failed"; break; }
+        vkBindBufferMemory(dev, bufs[i], mems[i], 0);
+    }
+
+    VkShaderModule modFma = VK_NULL_HANDLE, modCopy = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+    VkPipelineLayout pl = VK_NULL_HANDLE;
+    VkPipeline pipeFma = VK_NULL_HANDLE, pipeCopy = VK_NULL_HANDLE;
+    VkDescriptorPool dpool = VK_NULL_HANDLE;
+    VkDescriptorSet setFma = VK_NULL_HANDLE, setCopy = VK_NULL_HANDLE;
+    VkCommandPool pool = VK_NULL_HANDLE;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkQueryPool qp = VK_NULL_HANDLE;
+
+    if (failure.empty()) {
+        VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        smi.codeSize = sizeof(kSpv_fma32);
+        smi.pCode = kSpv_fma32;
+        if (vkCreateShaderModule(dev, &smi, nullptr, &modFma) != VK_SUCCESS) failure = "shader module (fma) failed";
+        smi.codeSize = sizeof(kSpv_copy);
+        smi.pCode = kSpv_copy;
+        if (failure.empty() && vkCreateShaderModule(dev, &smi, nullptr, &modCopy) != VK_SUCCESS) failure = "shader module (copy) failed";
+    }
+    if (failure.empty()) {
+        VkDescriptorSetLayoutBinding b[2]{};
+        for (uint32_t i = 0; i < 2; ++i) {
+            b[i].binding = i;
+            b[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            b[i].descriptorCount = 1;
+            b[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo li{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        li.bindingCount = 2;
+        li.pBindings = b;
+        vkCreateDescriptorSetLayout(dev, &li, nullptr, &dsl);
+        VkPushConstantRange pcr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 8};
+        VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pli.setLayoutCount = 1;
+        pli.pSetLayouts = &dsl;
+        pli.pushConstantRangeCount = 1;
+        pli.pPushConstantRanges = &pcr;
+        vkCreatePipelineLayout(dev, &pli, nullptr, &pl);
+
+        VkComputePipelineCreateInfo ci[2]{};
+        VkShaderModule mods[2] = {modFma, modCopy};
+        for (int i = 0; i < 2; ++i) {
+            ci[i].sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
+            ci[i].stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            ci[i].stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            ci[i].stage.module = mods[i];
+            ci[i].stage.pName = "main";
+            ci[i].layout = pl;
+        }
+        VkPipeline pipes[2] = {};
+        if (vkCreateComputePipelines(dev, VK_NULL_HANDLE, 2, ci, nullptr, pipes) != VK_SUCCESS) failure = "compute pipeline creation failed";
+        pipeFma = pipes[0];
+        pipeCopy = pipes[1];
+    }
+    if (failure.empty()) {
+        VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+        VkDescriptorPoolCreateInfo pci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        pci.maxSets = 2;
+        pci.poolSizeCount = 1;
+        pci.pPoolSizes = &ps;
+        vkCreateDescriptorPool(dev, &pci, nullptr, &dpool);
+        VkDescriptorSetLayout layouts[2] = {dsl, dsl};
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = dpool;
+        ai.descriptorSetCount = 2;
+        ai.pSetLayouts = layouts;
+        VkDescriptorSet sets[2] = {};
+        if (vkAllocateDescriptorSets(dev, &ai, sets) != VK_SUCCESS) failure = "descriptor allocation failed";
+        setFma = sets[0];
+        setCopy = sets[1];
+        VkDescriptorBufferInfo bi[4] = {{bufs[2], 0, VK_WHOLE_SIZE}, {bufs[1], 0, VK_WHOLE_SIZE},
+                                        {bufs[0], 0, VK_WHOLE_SIZE}, {bufs[1], 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet w[4]{};
+        VkDescriptorSet tgt[4] = {setFma, setFma, setCopy, setCopy};
+        for (int i = 0; i < 4; ++i) {
+            w[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet = tgt[i];
+            w[i].dstBinding = static_cast<uint32_t>(i % 2);
+            w[i].descriptorCount = 1;
+            w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w[i].pBufferInfo = &bi[i];
+        }
+        if (failure.empty()) vkUpdateDescriptorSets(dev, 4, w, 0, nullptr);
+    }
+    if (failure.empty()) {
+        VkCommandPoolCreateInfo cpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        cpi.queueFamilyIndex = static_cast<uint32_t>(qfi);
+        vkCreateCommandPool(dev, &cpi, nullptr, &pool);
+        VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cai.commandPool = pool;
+        cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cai.commandBufferCount = 1;
+        vkAllocateCommandBuffers(dev, &cai, &cmd);
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        vkCreateFence(dev, &fci, nullptr, &fence);
+        if (useTs) {
+            VkQueryPoolCreateInfo qpi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+            qpi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qpi.queryCount = 2;
+            if (vkCreateQueryPool(dev, &qpi, nullptr, &qp) != VK_SUCCESS) useTs = false;
+        }
+    }
+
+    VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+
+    // Runs `reps` dispatches of one pipeline, returns GPU (or wall) milliseconds, <0 on failure.
+    auto run = [&](bool fma, int reps) -> double {
+        vkResetCommandBuffer(cmd, 0);
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &bi);
+        if (useTs) {
+            vkCmdResetQueryPool(cmd, qp, 0, 2);
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, 0);
+        }
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, fma ? pipeFma : pipeCopy);
+        VkDescriptorSet s = fma ? setFma : setCopy;
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &s, 0, nullptr);
+        struct { float seed; uint32_t iters; } pc{0.25f, fmaIters};
+        vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 8, &pc);
+        for (int i = 0; i < reps; ++i) {
+            vkCmdDispatch(cmd, fma ? fmaGroups : copyGroups, 1, 1);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        }
+        if (useTs) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 1);
+        vkEndCommandBuffer(cmd);
+        vkResetFences(dev, 1, &fence);
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        auto t0 = std::chrono::steady_clock::now();
+        if (vkQueueSubmit(queue, 1, &si, fence) != VK_SUCCESS) return -1;
+        if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 30ull * 1000 * 1000 * 1000) != VK_SUCCESS) return -1;
+        double wall = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (useTs) {
+            uint64_t ts[2] = {0, 0};
+            if (vkGetQueryPoolResults(dev, qp, 0, 2, sizeof ts, ts, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS && ts[1] > ts[0]) {
+                uint64_t mask = qf[qfi].timestampValidBits >= 64 ? ~0ull : ((1ull << qf[qfi].timestampValidBits) - 1);
+                double gpu = static_cast<double>((ts[1] - ts[0]) & mask) * props.limits.timestampPeriod / 1e6;
+                if (gpu > 0) return gpu;
+            }
+        }
+        return wall;
+    };
+
+    double fmaMs = 0, copyMs = 0;
+    int fmaReps = 8, copyReps = 8;
+    std::vector<double> sustained;
+    if (failure.empty()) {
+        // initialise source buffer
+        vkResetCommandBuffer(cmd, 0);
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        vkBeginCommandBuffer(cmd, &bi);
+        vkCmdFillBuffer(cmd, bufs[0], 0, VK_WHOLE_SIZE, 0x3F800000u);
+        vkEndCommandBuffer(cmd);
+        vkResetFences(dev, 1, &fence);
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        vkQueueSubmit(queue, 1, &si, fence);
+        vkWaitForFences(dev, 1, &fence, VK_TRUE, 10ull * 1000 * 1000 * 1000);
+
+        // calibrate so each submission takes ~100 ms (avoids GPU watchdog, keeps timing accurate)
+        double t = run(true, 1);
+        if (t < 0) failure = "compute submit failed (device lost?)";
+        else fmaReps = std::max(1, std::min(400, static_cast<int>(100.0 / std::max(t, 0.05))));
+        if (failure.empty()) {
+            t = run(false, 1);
+            if (t < 0) failure = "copy submit failed";
+            else copyReps = std::max(1, std::min(400, static_cast<int>(100.0 / std::max(t, 0.05))));
+        }
+        if (failure.empty()) {
+            double best = 1e30;
+            for (int k = 0; k < 5 && failure.empty(); ++k) {
+                double x = run(true, fmaReps);
+                if (x < 0) failure = "fma run failed"; else best = std::min(best, x);
+            }
+            fmaMs = best;
+        }
+        if (failure.empty()) {
+            double best = 1e30;
+            for (int k = 0; k < 5 && failure.empty(); ++k) {
+                double x = run(false, copyReps);
+                if (x < 0) failure = "copy run failed"; else best = std::min(best, x);
+            }
+            copyMs = best;
+        }
+        // sustained: keep the ALU loaded for `seconds`, one sample per ~second
+        if (failure.empty() && seconds > 0) {
+            auto end = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+            while (std::chrono::steady_clock::now() < end && failure.empty()) {
+                double acc = 0;
+                int cnt = 0;
+                auto segEnd = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+                while (std::chrono::steady_clock::now() < segEnd) {
+                    double x = run(true, fmaReps);
+                    if (x < 0) { failure = "sustained run failed"; break; }
+                    acc += x; ++cnt;
+                }
+                if (cnt > 0) {
+                    double flop = double(fmaGroups) * groupSize * fmaIters * 64.0 * fmaReps * cnt;
+                    sustained.push_back(flop / (acc / 1000.0) / 1e9);
+                }
+            }
+        }
+    }
+
+    if (qp) vkDestroyQueryPool(dev, qp, nullptr);
+    if (fence) vkDestroyFence(dev, fence, nullptr);
+    if (pool) vkDestroyCommandPool(dev, pool, nullptr);
+    if (dpool) vkDestroyDescriptorPool(dev, dpool, nullptr);
+    if (pipeFma) vkDestroyPipeline(dev, pipeFma, nullptr);
+    if (pipeCopy) vkDestroyPipeline(dev, pipeCopy, nullptr);
+    if (pl) vkDestroyPipelineLayout(dev, pl, nullptr);
+    if (dsl) vkDestroyDescriptorSetLayout(dev, dsl, nullptr);
+    if (modFma) vkDestroyShaderModule(dev, modFma, nullptr);
+    if (modCopy) vkDestroyShaderModule(dev, modCopy, nullptr);
+    for (int i = 0; i < 3; ++i) {
+        if (bufs[i]) vkDestroyBuffer(dev, bufs[i], nullptr);
+        if (mems[i]) vkFreeMemory(dev, mems[i], nullptr);
+    }
+    vkDestroyDevice(dev, nullptr);
+    if (!failure.empty()) return err(failure);
+
+    // 8 vec4 FMAs per loop iteration = 32 scalar FMA = 64 FLOP
+    double flops = double(fmaGroups) * groupSize * fmaIters * 64.0 * fmaReps;
+    double gflops = flops / (fmaMs / 1000.0) / 1e9;
+    double bytes = double(copyBytes) * 2.0 * copyReps;  // read + write
+    double gbs = bytes / (copyMs / 1000.0) / 1e9;
+    std::string sj;
+    for (size_t i = 0; i < sustained.size(); ++i) { if (i) sj += ","; sj += num(sustained[i]); }
+    double smin = sustained.empty() ? 0 : *std::min_element(sustained.begin(), sustained.end());
+    double smax = sustained.empty() ? 0 : *std::max_element(sustained.begin(), sustained.end());
+    return "{\"ok\":true,\"device\":" + q(props.deviceName) + ",\"driverVersion\":" + q(ver(props.driverVersion)) +
+           ",\"timer\":" + q(useTs ? "gpu-timestamps" : "wall-clock") + ",\"fp32Gflops\":" + num(gflops) +
+           ",\"computeGBs\":" + num(gbs) + ",\"fmaMs\":" + num(fmaMs) + ",\"copyMs\":" + num(copyMs) +
+           ",\"sustained\":[" + sj + "],\"stability\":" + num(smax > 0 ? smin / smax * 100.0 : 0) + "}";
+}
+
 std::string jstr(JNIEnv *env, jstring s) {
     if (!s) return "";
     const char *c = env->GetStringUTFChars(s, nullptr);
@@ -599,5 +946,12 @@ Java_com_elitetunerx_vk_VkNative_bandwidth(JNIEnv *env, jobject, jstring dir, js
                                            jint iters) {
     std::string d = jstr(env, dir), l = jstr(env, lib), h = jstr(env, hook);
     std::string r = benchImpl(d.empty() ? nullptr : d.c_str(), l.c_str(), h.c_str(), mb, iters);
+    return env->NewStringUTF(r.c_str());
+}
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_elitetunerx_vk_VkNative_compute(JNIEnv *env, jobject, jstring dir, jstring lib, jstring hook, jint seconds) {
+    std::string d = jstr(env, dir), l = jstr(env, lib), h = jstr(env, hook);
+    std::string r = computeImpl(d.empty() ? nullptr : d.c_str(), l.c_str(), h.c_str(), seconds);
     return env->NewStringUTF(r.c_str());
 }

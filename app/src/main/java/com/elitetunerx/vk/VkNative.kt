@@ -27,6 +27,7 @@ object VkNative {
     init { System.loadLibrary("etxvk") }
     external fun probe(driverDir: String?, driverLib: String?, hookDir: String): String
     external fun bandwidth(driverDir: String?, driverLib: String?, hookDir: String, mb: Int, iters: Int): String
+    external fun compute(driverDir: String?, driverLib: String?, hookDir: String, seconds: Int): String
 }
 
 /** Runs native Vulkan work in the isolated ":vk" process, then exits so every test gets a clean process. */
@@ -48,6 +49,7 @@ class VkWorkerService : Service() {
                         when (what) {
                             VkClient.PROBE -> VkNative.probe(dir, lib, hook)
                             VkClient.BANDWIDTH -> VkNative.bandwidth(dir, lib, hook, d.getInt("mb", 256), d.getInt("iters", 16))
+                            VkClient.COMPUTE -> VkNative.compute(dir, lib, hook, d.getInt("seconds", 0))
                             else -> JSONObject().put("ok", false).put("error", "unknown op").toString()
                         }
                     } catch (t: Throwable) {
@@ -66,6 +68,7 @@ class VkWorkerService : Service() {
 object VkClient {
     const val PROBE = 1
     const val BANDWIDTH = 2
+    const val COMPUTE = 3
 
     private fun err(m: String) = JSONObject().put("ok", false).put("error", m).toString()
 
@@ -117,6 +120,12 @@ object VkClient {
         })
 }
 
+suspend fun VkClient.compute(ctx: Context, d: CustomDriver?, seconds: Int = 0): String =
+    call(ctx, VkClient.COMPUTE, Bundle().apply {
+        d?.let { putString("dir", it.dir.absolutePath + "/"); putString("lib", it.libName) }
+        putInt("seconds", seconds)
+    }, timeoutMs = 60_000L + seconds * 1000L)
+
 data class CustomDriver(val id: String, val name: String, val version: String, val libName: String, val dir: File)
 
 /** Imports custom Vulkan drivers packaged as .zip (AdrenoTools / Turnip format with meta.json). */
@@ -131,11 +140,13 @@ object DriverStore {
         }.getOrNull()
     }.sortedBy { it.name }
 
-    fun import(ctx: Context, uri: Uri): CustomDriver {
+    fun import(ctx: Context, uri: Uri): CustomDriver =
+        importStream(ctx, ctx.contentResolver.openInputStream(uri) ?: error("cannot open file"))
+
+    fun importStream(ctx: Context, input: java.io.InputStream): CustomDriver {
         val id = "drv" + System.currentTimeMillis()
         val dir = File(root(ctx), id).apply { mkdirs() }
         try {
-            val input = ctx.contentResolver.openInputStream(uri) ?: error("cannot open file")
             ZipInputStream(input.buffered()).use { zin ->
                 while (true) {
                     val e = zin.nextEntry ?: break
@@ -162,7 +173,7 @@ object DriverStore {
 
     fun delete(ctx: Context, d: CustomDriver) {
         d.dir.deleteRecursively()
-        Prefs.get(ctx).edit().remove("vk_probe_${d.id}").remove("vk_bw_${d.id}").apply()
+        Prefs.get(ctx).edit().remove("vk_probe_${d.id}").remove("vk_bw_${d.id}").remove("vk_cs_${d.id}").apply()
     }
 
     fun saveResult(ctx: Context, kind: String, id: String, json: String) =

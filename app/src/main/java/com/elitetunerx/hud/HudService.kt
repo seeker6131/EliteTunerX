@@ -202,7 +202,8 @@ class HudService : Service() {
         text.text = sb
         if (a != null) {
             val dur = ((System.currentTimeMillis() - a.startMs) / 1000).toInt()
-            rec.text = String.format(Locale.US, "■ STOP  %02d:%02d  %d frames", dur / 60, dur % 60, synchronized(a) { a.frames.size })
+            val left = if (a.limitS > 0) String.format(Locale.US, "  (%ds left)", (a.limitS - dur).coerceAtLeast(0)) else ""
+            rec.text = String.format(Locale.US, "■ STOP  %02d:%02d  %d frames", dur / 60, dur % 60, synchronized(a) { a.frames.size }) + left
             rec.setTextColor(Color.rgb(255, 90, 90))
         } else {
             rec.text = "● REC  " + Prefs.label(this).take(26)

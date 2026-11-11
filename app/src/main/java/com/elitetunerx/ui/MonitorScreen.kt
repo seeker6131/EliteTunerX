@@ -11,6 +11,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -126,6 +127,13 @@ fun MonitorScreen() {
                 value = label, onValueChange = { label = it; Prefs.setLabel(ctx, it) }, singleLine = true,
                 label = { Text("ชื่อเซสชันถัดไป เช่น GTA V • DXVK 2.4 • Turnip 25.1") }, modifier = Modifier.fillMaxWidth()
             )
+            var limit by remember { mutableStateOf(Recorder.limit(ctx)) }
+            Body("ความยาวการอัด (หยุดเองอัตโนมัติ — ทุกรอบยาวเท่ากัน เทียบได้ยุติธรรม)", Color.White)
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf(30 to "30s", 60 to "60s", 120 to "120s", 0 to "กดหยุดเอง").forEach { (v, t) ->
+                    FilterChip(selected = limit == v, onClick = { limit = v; Recorder.setLimit(ctx, v) }, label = { Text(t) })
+                }
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (!hudRunning) PrimaryButton("เปิด HUD") {
                     if (!HudService.canDraw(ctx)) {
@@ -142,8 +150,14 @@ fun MonitorScreen() {
             }
             active?.let { a ->
                 val dur = ((System.currentTimeMillis() - a.startMs) / 1000).toInt() + tick * 0
+                if (a.limitS > 0) Text("หยุดอัตโนมัติใน ${(a.limitS - dur).coerceAtLeast(0)} วินาที", color = Warn, fontSize = 12.sp)
                 Text(String.format(Locale.US, "กำลังอัด: %s • %02d:%02d • %d เฟรม • %s", a.label, dur / 60, dur % 60, synchronized(a) { a.frames.size }, a.pkg ?: "-"),
                     color = Bad, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+            }
+            val saved by Recorder.lastSaved.collectAsState()
+            saved?.let { sv ->
+                val sm = sv.summary
+                Body("ผลล่าสุด: ${sv.label} • avg ${fmt(sm.avgFps)} • 1% low ${fmt(sm.low1)} • ${fmt(sm.avgWatts, "%.2f", " W")} (ดูทั้งหมดในแท็บ Sessions)", Good)
             }
             if (!HudService.canDraw(ctx)) Body("ต้องอนุญาต \"แสดงทับแอปอื่น\" ก่อน (กดเปิด HUD เพื่อไปหน้าตั้งค่า)", Warn)
         }

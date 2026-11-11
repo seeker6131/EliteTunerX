@@ -107,22 +107,33 @@ class Session(
     }
 }
 
-class ActiveSession(val id: String, val label: String, var pkg: String?, val startMs: Long) {
+class ActiveSession(val id: String, val label: String, var pkg: String?, val startMs: Long, val limitS: Int = 0) {
     val frames = ArrayList<Double>()
     val samples = ArrayList<Sample>()
 }
 
 object Recorder {
     val active = MutableStateFlow<ActiveSession?>(null)
+    val lastSaved = MutableStateFlow<Session?>(null)
+    @Volatile var appCtx: Context? = null
+
+    /** Auto-stop length in seconds (0 = manual). Same length for every run = fair A/B comparison. */
+    fun limit(ctx: Context): Int = com.elitetunerx.Prefs.get(ctx).getInt("rec_limit", 60)
+    fun setLimit(ctx: Context, s: Int) = com.elitetunerx.Prefs.get(ctx).edit().putInt("rec_limit", s).apply()
 
     fun start(label: String) {
         if (active.value != null) return
         val now = System.currentTimeMillis()
-        active.value = ActiveSession(now.toString(), label.ifBlank { "Session" }, Telemetry.snapshot.value?.fgPackage, now)
+        val lim = appCtx?.let { limit(it) } ?: 0
+        active.value = ActiveSession(now.toString(), label.ifBlank { "Session" }, Telemetry.snapshot.value?.fgPackage, now, lim)
     }
 
     fun onSnapshot(s: Snapshot) {
         val a = active.value ?: return
+        if (a.limitS > 0 && (s.timeMs - a.startMs) >= a.limitS * 1000L) {
+            appCtx?.let { stop(it) }
+            return
+        }
         synchronized(a) {
             if (a.pkg == null) a.pkg = s.fgPackage
             a.frames.addAll(s.newFrameTimes)
@@ -142,6 +153,7 @@ object Recorder {
             Session(a.id, a.label, a.pkg, a.startMs, (System.currentTimeMillis() - a.startMs) / 1000.0, a.frames.toDoubleArray(), a.samples.toList())
         }
         SessionStore.save(ctx, sess)
+        lastSaved.value = sess
         return sess
     }
 

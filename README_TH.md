@@ -1,4 +1,4 @@
-# Elite Tuner X 0.2.0
+# Elite Tuner X 0.3.0
 
 แอป Android สำหรับ Xiaomi Pad 8 Pro / Snapdragon 8 Elite (Adreno 830) แบบ **ไม่รูท**
 วัดค่าจริง • HUD ทับเกม • เบนช์มาร์ก • ตรวจไดรเวอร์ Vulkan สำหรับ DXVK/VKD3D • จูนผ่าน Shizuku
@@ -24,6 +24,10 @@
 | Vulkan probe | อ่าน feature/extension/limit จริงจากไดรเวอร์ → ตาราง DXVK 1.10 / DXVK 2.x / D8VK / VKD3D-Proton | ✘ |
 | Turnip / custom driver | นำเข้า .zip (AdrenoTools + meta.json) แล้วโหลดใน process แยกด้วย libadrenotools → probe + bandwidth bench เทียบกับไดรเวอร์ระบบ | ✘ |
 | Vulkan bandwidth | vkCmdCopyBuffer / vkCmdFillBuffer บน VRAM | ✘ |
+| Vulkan compute benchmark | compute shader FP32 FMA (GFLOPS) + shader bandwidth, จับเวลาด้วย GPU timestamp, โหมด stress 60s | ✘ |
+| Driver Shootout | รัน probe + bandwidth + compute กับทุกไดรเวอร์ แล้วจัดอันดับ | ✘ |
+| ดาวน์โหลด Turnip / DXVK / VKD3D | ดึงจาก GitHub release ทางการ; Turnip ติดตั้งเข้าแอป, DXVK/VKD3D บันทึกที่ Download/EliteTunerX | ✘ |
+| อัดเซสชันแบบจับเวลา | หยุดอัตโนมัติ 30/60/120 วิ เพื่อเทียบ DXVK อย่างยุติธรรม | ✔ |
 | Tuning | refresh-rate lock, animation scale, fixed performance mode, Game Mode + intervention (downscale/FPS cap), ล้าง RAM, ปิด phantom process killer, AOT compile, battery whitelist, ANGLE ต่อแอป, updatable driver ต่อแอป, thermal report, revert all | ✔ |
 
 ทุกค่าที่แสดงจะมีแหล่งที่มากำกับ ถ้าเฟิร์มแวร์บล็อก sensor ตัวไหน จะแสดง **N/A** — ไม่มีการสุ่มหรือเดาค่า

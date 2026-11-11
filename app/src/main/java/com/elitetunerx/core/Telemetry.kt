@@ -67,6 +67,7 @@ object Telemetry {
 
     @Synchronized
     fun acquire(ctx: Context) {
+        Recorder.appCtx = ctx.applicationContext
         users++
         if (job == null) {
             val app = ctx.applicationContext
