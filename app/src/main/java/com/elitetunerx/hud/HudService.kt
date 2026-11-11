@@ -34,6 +34,7 @@ import com.elitetunerx.core.Snapshot
 import com.elitetunerx.core.Telemetry
 import com.elitetunerx.session.ActiveSession
 import com.elitetunerx.session.Recorder
+import com.elitetunerx.tune.BoostTest
 import kotlinx.coroutines.MainScope
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -61,6 +62,7 @@ class HudService : Service() {
     private var root: LinearLayout? = null
     private lateinit var text: TextView
     private lateinit var rec: TextView
+    private lateinit var info: TextView
     private lateinit var lp: WindowManager.LayoutParams
     private var compact = false
     private var last: Pair<Snapshot?, ActiveSession?> = null to null
@@ -75,7 +77,7 @@ class HudService : Service() {
         wm = getSystemService(WindowManager::class.java)
         if (canDraw(this)) addOverlay()
         scope.launch {
-            combine(Telemetry.snapshot, Recorder.active) { s, a -> s to a }.collect {
+            combine(Telemetry.snapshot, Recorder.active, BoostTest.phase, BoostTest.result) { s, a, _, _ -> s to a }.collect {
                 last = it
                 render()
                 updateNotification()
@@ -114,7 +116,11 @@ class HudService : Service() {
             setTextColor(Color.rgb(255, 90, 90))
             setOnClickListener { Recorder.toggle(this@HudService, Prefs.label(this@HudService)) }
         }
-        val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; background = bg; addView(text); addView(rec) }
+        info = TextView(this).apply {
+            textSize = 11f; setTextColor(Color.rgb(255, 214, 98)); setPadding(dp(8), 0, dp(8), dp(6)); maxWidth = dp(320)
+            setOnClickListener { BoostTest.result.value = null }
+        }
+        val layout = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; background = bg; addView(text); addView(rec); addView(info) }
         lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -209,6 +215,14 @@ class HudService : Service() {
             rec.text = "● REC  " + Prefs.label(this).take(26)
             rec.setTextColor(Color.rgb(255, 150, 150))
         }
+        val ph = BoostTest.phase.value
+        val res = BoostTest.result.value
+        info.text = when {
+            ph != null -> "A/B BOOST: $ph"
+            res != null -> "A/B RESULT (แตะเพื่อปิด)\n$res"
+            else -> ""
+        }
+        info.visibility = if (info.text.isNullOrEmpty()) View.GONE else View.VISIBLE
     }
 
     private fun notification(): Notification {

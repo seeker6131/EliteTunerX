@@ -121,10 +121,10 @@ object Recorder {
     fun limit(ctx: Context): Int = com.elitetunerx.Prefs.get(ctx).getInt("rec_limit", 60)
     fun setLimit(ctx: Context, s: Int) = com.elitetunerx.Prefs.get(ctx).edit().putInt("rec_limit", s).apply()
 
-    fun start(label: String) {
+    fun start(label: String, limitOverride: Int? = null) {
         if (active.value != null) return
         val now = System.currentTimeMillis()
-        val lim = appCtx?.let { limit(it) } ?: 0
+        val lim = limitOverride ?: appCtx?.let { limit(it) } ?: 0
         active.value = ActiveSession(now.toString(), label.ifBlank { "Session" }, Telemetry.snapshot.value?.fgPackage, now, lim)
     }
 

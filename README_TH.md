@@ -1,4 +1,4 @@
-# Elite Tuner X 0.3.0
+# Elite Tuner X 0.4.0
 
 แอป Android สำหรับ Xiaomi Pad 8 Pro / Snapdragon 8 Elite (Adreno 830) แบบ **ไม่รูท**
 วัดค่าจริง • HUD ทับเกม • เบนช์มาร์ก • ตรวจไดรเวอร์ Vulkan สำหรับ DXVK/VKD3D • จูนผ่าน Shizuku
@@ -27,6 +27,9 @@
 | Vulkan compute benchmark | compute shader FP32 FMA (GFLOPS) + shader bandwidth, จับเวลาด้วย GPU timestamp, โหมด stress 60s | ✘ |
 | Driver Shootout | รัน probe + bandwidth + compute กับทุกไดรเวอร์ แล้วจัดอันดับ | ✘ |
 | ดาวน์โหลด Turnip / DXVK / VKD3D | ดึงจาก GitHub release ทางการ; Turnip ติดตั้งเข้าแอป, DXVK/VKD3D บันทึกที่ Download/EliteTunerX | ✘ |
+| Game Boost | ปิดแอปเบื้องหลัง, แช่แข็งแอปขยะ MIUI, ปิด Doze/phantom killer, จำกัด cached apps, (ตัวเลือก) ปิด Joyose / thermal override — แสดง RAM % ก่อน→หลัง | ✔ |
+| A/B Boost Test | วัด FPS ในเกมจริงก่อน/หลัง Boost อัตโนมัติ แล้วสรุป % บน HUD | ✔ |
+| System resolution | `wm size`/`wm density` ลดพิกเซลทั้งระบบ | ✔ |
 | อัดเซสชันแบบจับเวลา | หยุดอัตโนมัติ 30/60/120 วิ เพื่อเทียบ DXVK อย่างยุติธรรม | ✔ |
 | Tuning | refresh-rate lock, animation scale, fixed performance mode, Game Mode + intervention (downscale/FPS cap), ล้าง RAM, ปิด phantom process killer, AOT compile, battery whitelist, ANGLE ต่อแอป, updatable driver ต่อแอป, thermal report, revert all | ✔ |
 

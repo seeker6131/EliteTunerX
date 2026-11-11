@@ -74,6 +74,8 @@ fun TuneScreen() {
             PrimaryButton("เลือกแอป") { picking = true }
         }
 
+        BoostCard(target)
+
         // ---------------- display
         val rates = remember { Tweaks.supportedRates(ctx) }
         PanelCard("REFRESH RATE LOCK") {
