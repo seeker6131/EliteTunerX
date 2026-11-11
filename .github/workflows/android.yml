@@ -1,0 +1,63 @@
+name: Elite Tuner X APK
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Build release APK
+        run: |
+          chmod +x gradlew
+          set +e
+          ./gradlew --no-daemon assembleRelease 2>&1 | tee build.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            echo "=================== BUILD ERRORS ==================="
+            grep -E "^e: |error:|What went wrong|FAILED" -A3 build.log | grep -v "^--$" | head -120
+            exit "$status"
+          fi
+
+      - name: Rename APK
+        run: |
+          VERSION=$(grep -oP 'versionName = "\K[^"]+' app/build.gradle.kts)
+          mkdir -p out
+          cp app/build/outputs/apk/release/app-release.apk "out/EliteTunerX-${VERSION}-build${{ github.run_number }}.apk"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EliteTunerX-apk
+          path: out/*.apk
+
+      - name: Publish GitHub Release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: elitetunerx-v${{ env.VERSION }}-build${{ github.run_number }}
+          name: Elite Tuner X ${{ env.VERSION }} (build ${{ github.run_number }})
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          files: out/*.apk
+          body: |
+            Elite Tuner X ${{ env.VERSION }} — built from ${{ github.sha }} on branch ${{ github.ref_name }}.
+            ดาวน์โหลดไฟล์ .apk ด้านล่างแล้วติดตั้งบน Xiaomi Pad 8 Pro (อนุญาตติดตั้งจากแหล่งที่ไม่รู้จัก)
